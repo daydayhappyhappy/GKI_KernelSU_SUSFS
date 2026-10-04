@@ -302,59 +302,15 @@ jobs:
           git config --global user.email "BuildGkiKernel@gmail.com"
 
       - name: 克隆依赖仓库
+        # 按 ksu_mode / ksu_variant 门控：禁用KSU / 禁用SUSFS 时不再 clone susfs4ksu 与 SukiSU_patch，
+        # 节省约 3~5 分钟拉取时间，也避免纯 GKI 构建对这些仓库产生无谓依赖。
+        # LEGACY_SUKISU_CONFIG 在「初始化构建环境」步骤已 export 进 $GITHUB_ENV，此处可直接读取。
         run: |
-          ANYKERNEL_BRANCH="gki-2.0"
-          SUSFS_BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
-
-          echo "克隆 AnyKernel3..."
-          git clone https://github.com/WildKernels/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
-          rm -rf AnyKernel3/.git
-
-          echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
-          if [ -n "$LEGACY_SUKISU_CONFIG" ]; then
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-          elif [ "${{ inputs.ksu_variant }}" == "SukiSU" ]; then
-            if ! git clone https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_BRANCH" 2>/dev/null; then
-              echo "ShirkNeko 仓库未找到分支 $SUSFS_BRANCH，回退到 simonpunk 原版..."
-              git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-            fi
-          else
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-          fi
-
-          if [ -n "$LEGACY_SUKISU_CONFIG" ]; then
-            SUSFS_FIXED_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$LEGACY_SUKISU_CONFIG" | cut -d'=' -f2-)
-            if [ -z "$SUSFS_FIXED_COMMIT" ]; then
-              echo "未在 $LEGACY_SUKISU_CONFIG 配置 $SUSFS_BRANCH 的固定 SUSFS 提交" >&2
-              exit 1
-            fi
-            echo "${{ inputs.ksu_variant }} 固定 SUSFS 提交: $SUSFS_FIXED_COMMIT"
-            git -C susfs4ksu checkout "$SUSFS_FIXED_COMMIT"
-          fi
-
-          CONFIG_FILE="config/config"
-          if [ -z "$LEGACY_SUKISU_CONFIG" ] && [ -f "$CONFIG_FILE" ]; then
-            CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
-            if [ "$CUSTOM_ENABLED" == "true" ]; then
-              CUSTOM_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$CONFIG_FILE" | cut -d'=' -f2)
-              if [ -n "$CUSTOM_COMMIT" ]; then
-                echo "切换 SUSFS 到自定义提交: $CUSTOM_COMMIT"
-                cd susfs4ksu
-                git checkout "$CUSTOM_COMMIT"
-                cd ..
-              fi
-            fi
-          fi
-
-          SUSFS_LATEST_COMMIT_DATE=$(git -C susfs4ksu log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
-          echo "SUSFS_LATEST_COMMIT_DATE=$SUSFS_LATEST_COMMIT_DATE" >> $GITHUB_ENV
-          echo "SUSFS 仓库最新提交日期: $SUSFS_LATEST_COMMIT_DATE"
-
-          echo "准备补丁资源..."
-          git clone https://github.com/WildKernels/kernel_patches.git
-          git clone https://github.com/ShirkNeko/SukiSU_patch.git
-          echo "使用当前仓库补丁目录: $ZZH_PATCHES"
-          git clone https://github.com/Numbersf/Action-Build.git --depth=1
+          bash "$GITHUB_WORKSPACE/scripts/clone_deps.sh" \
+            "${{ inputs.ksu_mode }}" \
+            "${{ inputs.ksu_variant }}" \
+            "${{ inputs.android_version }}" \
+            "${{ inputs.kernel_version }}"
 
       - name: 初始化并同步内核源码
         working-directory: ${{ env.KERNEL_ROOT }}
@@ -717,7 +673,7 @@ jobs:
           echo "基线树对象: $SUSFS_BASE_TREE"
 
       - name: 应用 SUSFS 补丁
-        if: inputs.enable_susfs
+        if: inputs.enable_susfs && inputs.ksu_mode != '禁用KSU'
         working-directory: ${{ env.KERNEL_ROOT }}
         env:
           ANDROID_VERSION: ${{ inputs.android_version }}
@@ -817,6 +773,16 @@ jobs:
 
       - name: 备份基准 defconfig
         run: cp "$DEFCONFIG" "$DEFCONFIG.orig"
+
+      - name: 校验纯 GKI defconfig 洁净度
+        # 仅在「禁用KSU」模式下生效：检测 defconfig 是否残留 KSU/SUSFS/KPM 符号。
+        # 上游分支或自定义 fragment 若遗留 CONFIG_KSU=y，bazel 的 defconfig 检查会直接失败，
+        # 这里提前抓出并给出明确报错，避免浪费一次完整构建。
+        if: inputs.ksu_mode == '禁用KSU'
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/defconfig/verify_pure_gki.sh" \
+            "$DEFCONFIG" \
+            "${{ inputs.ksu_mode }}"
 
       - name: 集成 NoMount 挂载元模块
         if: inputs.use_nomount
